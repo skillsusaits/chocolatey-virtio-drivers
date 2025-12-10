@@ -1,0 +1,34 @@
+VERIFICATION
+
+This Chocolatey package does not embed any binaries. Instead, it downloads the 
+official virtio-win ISO directly from the upstream Fedora People repository during 
+installation.
+
+DOWNLOAD SOURCE:
+The package downloads from:
+https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/
+
+The specific ISO URL and checksum are defined in chocolateyinstall.ps1.
+
+PACKAGE BEHAVIOR:
+1. Downloads the official virtio-win ISO from Fedora People repository
+2. Verifies the download using SHA-512 checksum
+3. Extracts the ISO contents
+4. Detects the installed Windows version and architecture
+5. Installs the appropriate virtIO drivers for the detected system
+
+The package automatically selects drivers compatible with:
+- Windows version (Windows 11, 10, 8.1, 8, 7, Server editions)
+- System architecture (amd64 or x86)
+
+VERIFICATION STEPS:
+To verify this package:
+1. Review chocolateyinstall.ps1 for the download URL and checksum
+2. Manually download the ISO from the specified URL
+3. Calculate the SHA-512 checksum of the downloaded file
+4. Confirm it matches the checksum in chocolateyinstall.ps1
+
+UPSTREAM PROJECT:
+- Source code: https://github.com/virtio-win/kvm-guest-drivers-windows
+- Documentation: https://wiki.libvirt.org/page/Virtio
+- Official downloads: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
