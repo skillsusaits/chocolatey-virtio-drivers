@@ -1,0 +1,94 @@
+name: Build and Publish Chocolatey Package
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update files with version and checksum
+        id: version
+        shell: pwsh
+        run: |
+          $tagName = "${{ github.ref_name }}"
+          
+          # Run update script
+          .\update-version.ps1 -VirtioVersion $tagName
+          
+          # Read updated values for outputs
+          $nuspecContent = Get-Content "virtio-drivers.nuspec" -Raw
+          if ($nuspecContent -match '<version>(.*?)</version>') {
+            $packageVersion = $Matches[1]
+          }
+          
+          $installContent = Get-Content "tools/chocolateyinstall.ps1" -Raw
+          if ($installContent -match "url = '(.*?)'") {
+            $url = $Matches[1]
+          }
+          if ($installContent -match "checksum = '(.*?)'") {
+            $checksum = $Matches[1]
+          }
+          
+          # Set outputs for later steps
+          echo "VERSION=$packageVersion" >> $env:GITHUB_OUTPUT
+          echo "VIRTIO_VERSION=$tagName" >> $env:GITHUB_OUTPUT
+          echo "URL=$url" >> $env:GITHUB_OUTPUT
+          echo "CHECKSUM=$checksum" >> $env:GITHUB_OUTPUT
+          echo "CHECKSUM_TYPE=sha512" >> $env:GITHUB_OUTPUT
+          
+          Write-Host "Package Version: $packageVersion"
+          Write-Host "VirtIO Version: $tagName"
+
+      - name: Install Chocolatey
+        shell: pwsh
+        run: |
+          if (!(Get-Command choco -ErrorAction SilentlyContinue)) {
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+            iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          }
+
+      - name: Pack Chocolatey package
+        shell: pwsh
+        run: |
+          choco pack virtio-drivers.nuspec
+
+      - name: Test package locally
+        shell: pwsh
+        run: |
+          $package = Get-ChildItem -Filter "virtio-drivers.${{ steps.version.outputs.VERSION }}.nupkg"
+          Write-Host "Package created: $($package.Name)"
+          Write-Host "Package size: $($package.Length) bytes"
+
+      - name: Publish to Chocolatey Community Repository
+        shell: pwsh
+        env:
+          CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
+        run: |
+          if ($env:CHOCO_API_KEY) {
+            choco push virtio-drivers.${{ steps.version.outputs.VERSION }}.nupkg --source https://push.chocolatey.org/ --api-key $env:CHOCO_API_KEY
+          } else {
+            Write-Host "CHOCO_API_KEY secret not set. Skipping publish."
+          }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: "*.nupkg"
+          body: |
+            VirtIO Drivers Chocolatey Package
+            
+            **VirtIO Version:** ${{ steps.version.outputs.VIRTIO_VERSION }}
+            **Package Version:** ${{ steps.version.outputs.VERSION }}
+            **ISO URL:** ${{ steps.version.outputs.URL }}
+            **SHA512 Checksum:** ${{ steps.version.outputs.CHECKSUM }}
+            
+            Install with: `choco install virtio-drivers --version=${{ steps.version.outputs.VERSION }}`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
