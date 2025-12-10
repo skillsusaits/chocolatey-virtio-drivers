@@ -51,12 +51,3 @@ To build the package locally:
 ```powershell
 choco pack virtio-drivers.nuspec
 ```
-
-## Version Configuration
-
-All version information is centralized in `version.json`:
-- `version`: Chocolatey package version
-- `virtio_version`: VirtIO release version
-- `url`: Download URL for the ISO
-- `checksum`: SHA512 checksum
-- `checksumType`: Hash algorithm (sha512)
