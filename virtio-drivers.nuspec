@@ -8,7 +8,7 @@
     <owners>nick123pig,DDoSolitary</owners>
     <licenseUrl>https://github.com/virtio-win/kvm-guest-drivers-windows/blob/master/LICENSE</licenseUrl>
     <projectUrl>http://www.linux-kvm.org/page/WindowsGuestDrivers</projectUrl>
-    <packageSourceUrl url="https://github.com/skillsusaits/chocolatey-virtio-drivers" />
+    <packageSourceUrl>https://github.com/skillsusaits/chocolatey-virtio-drivers</packageSourceUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <description>Virtio is a virtualization standard for network and disk device drivers where just the guest's device driver "knows" it is running in a virtual environment, and cooperates with the hypervisor. This enables guests to get high performance network and disk operations, and gives most of the performance benefits of paravirtualization.</description>
     <summary>virtIO is a virtualization standard for network and disk device drivers.</summary>
