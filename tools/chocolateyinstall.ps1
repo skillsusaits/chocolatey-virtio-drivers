@@ -63,4 +63,6 @@ $installArgs = @{
 }
 Install-ChocolateyInstallPackage @installArgs
 
+# Remove read-only attribute from all files and directories before deletion
+Get-ChildItem -Path $extractPath -Recurse | ForEach-Object { $_.Attributes = 'Normal' }
 Remove-Item -Recurse -Force $extractPath
