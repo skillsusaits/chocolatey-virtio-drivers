@@ -78,17 +78,22 @@ jobs:
           }
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: "*.nupkg"
-          body: |
-            VirtIO Drivers Chocolatey Package
-            
-            **VirtIO Version:** ${{ steps.version.outputs.VIRTIO_VERSION }}
-            **Package Version:** ${{ steps.version.outputs.VERSION }}
-            **ISO URL:** ${{ steps.version.outputs.URL }}
-            **SHA512 Checksum:** ${{ steps.version.outputs.CHECKSUM }}
-            
-            Install with: `choco install virtio-drivers --version=${{ steps.version.outputs.VERSION }}`
+        shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $body = @"
+          VirtIO Drivers Chocolatey Package
+          
+          **VirtIO Version:** ${{ steps.version.outputs.VIRTIO_VERSION }}
+          **Package Version:** ${{ steps.version.outputs.VERSION }}
+          **ISO URL:** ${{ steps.version.outputs.URL }}
+          **SHA512 Checksum:** ${{ steps.version.outputs.CHECKSUM }}
+          
+          Install with: ``choco install virtio-drivers --version=${{ steps.version.outputs.VERSION }}``
+          "@
+          
+          gh release create "${{ github.ref_name }}" `
+            --title "VirtIO Drivers ${{ steps.version.outputs.VERSION }}" `
+            --notes $body `
+            virtio-drivers.${{ steps.version.outputs.VERSION }}.nupkg
