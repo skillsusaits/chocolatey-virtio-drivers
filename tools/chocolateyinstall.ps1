@@ -63,4 +63,4 @@ $installArgs = @{
 }
 Install-ChocolateyInstallPackage @installArgs
 
-Remove-Item -Recurse $extractPath
+Remove-Item -Recurse -Force $extractPath
