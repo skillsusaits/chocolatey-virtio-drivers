@@ -28,7 +28,7 @@ jobs:
             # For tag builds, update nuspec + install script from the VirtIO tag.
             .\update-version.ps1 -VirtioVersion $refName
           } else {
-            Write-Host "Non-tag build ($refType: $refName). Skipping update-version.ps1 and packing current repo state."
+            Write-Host "Non-tag build (${refType}: ${refName}). Skipping update-version.ps1 and packing current repo state."
           }
 
           # Read values for outputs (works for both tag and branch builds)
