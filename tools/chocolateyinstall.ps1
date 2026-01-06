@@ -45,8 +45,12 @@ function Invoke-ExternalExe {
 
 function Get-PnpPublishedName {
         param(
-                [Parameter(Mandatory = $true)][string[]]$OutputLines
+                [Parameter()][AllowEmptyCollection()][AllowNull()][string[]]$OutputLines = @()
         )
+
+        if (-not $OutputLines -or $OutputLines.Count -eq 0) {
+                return $null
+        }
 
         foreach ($line in $OutputLines) {
                 if ($line -match '(?i)^\s*Published\s+Name\s*:\s*(.+?)\s*$') {
@@ -137,7 +141,7 @@ $info.drivers | where { $_.arch -eq $arch -and $_.windows_version -eq $os } | % 
                 throw "pnputil.exe failed (exit code $($pnpResult.ExitCode)) while installing driver '$($_.name)' from '$infPath'. Output:${([Environment]::NewLine)}$details"
         }
 
-        $publishedName = Get-PnpPublishedName -OutputLines $pnpResult.AllOutput
+        $publishedName = Get-PnpPublishedName -OutputLines @($pnpResult.AllOutput)
         if ($publishedName) {
                 Add-Content -Path $infListPath -Value $publishedName
         }
