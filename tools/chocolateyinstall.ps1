@@ -77,11 +77,16 @@ function Install-CatalogCertificateChain {
                 throw "Catalog file was not found: '$CatalogPath'"
         }
 
-        $sig = Get-AuthenticodeSignature -LiteralPath $CatalogPath
-        $signer = $sig.SignerCertificate
+                $sig = Get-AuthenticodeSignature -LiteralPath $CatalogPath
+                $signer = $sig.SignerCertificate
         if (-not $signer) {
             throw "Failed to extract signer certificate from catalog: '$CatalogPath'"
         }
+
+                # Many environments can successfully install drivers by trusting the publisher certificate directly.
+                # Do this up-front so we don't depend on a complete chain build (AIA fetch, Windows Update roots, etc.).
+                Add-CertificateToStore -Certificate $signer -StoreName 'TrustedPublisher'
+                Add-CertificateToStore -Certificate $signer -StoreName 'TrustedPeople'
 
         $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
         $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
@@ -97,16 +102,19 @@ function Install-CatalogCertificateChain {
         New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 
         try {
-                # Install chain elements (root/intermediates) to ensure pnputil can validate the signature.
-                # Root (self-signed) -> Root store; intermediates -> CA store; signer -> TrustedPublisher (+ TrustedPeople).
+                # Best-effort: install chain elements (root/intermediates).
+                # Root (self-signed) -> Root store; intermediates -> CA store.
                 $elements = @($chain.ChainElements | ForEach-Object { $_.Certificate })
                 for ($i = 0; $i -lt $elements.Count; $i++) {
                         $c = $elements[$i]
 
                         $isSelfSigned = ($c.Subject -eq $c.Issuer)
                         $isSigner = ($c.Thumbprint -eq $signer.Thumbprint)
+                        if ($isSigner) {
+                                continue
+                        }
 
-                        $storeName = if ($isSelfSigned) { 'Root' } elseif ($isSigner) { 'TrustedPublisher' } else { 'CA' }
+                        $storeName = if ($isSelfSigned) { 'Root' } else { 'CA' }
 
                         $cerPath = Join-Path $tmp ("chain-{0:D2}-{1}.cer" -f $i, $storeName)
                         [IO.File]::WriteAllBytes($cerPath, $c.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
@@ -118,18 +126,55 @@ function Install-CatalogCertificateChain {
                                 throw "certutil.exe failed (exit code $($addResult.ExitCode)) while adding certificate to '$storeName' store. Output:${([Environment]::NewLine)}$details"
                         }
 
-                        if ($isSigner) {
-                                $tpResult = Invoke-ExternalExe -FilePath 'certutil.exe' -ArgumentList @('/addstore', '-f', 'TrustedPeople', $cerPath) -DisplayName 'certutil addstore TrustedPeople'
-                                $tpResult.AllOutput | ForEach-Object { Write-Host $_ }
-                                if ($tpResult.ExitCode -ne 0) {
-                                        $details = ($tpResult.AllOutput -join [Environment]::NewLine)
-                                        throw "certutil.exe failed (exit code $($tpResult.ExitCode)) while adding signer certificate to 'TrustedPeople' store. Output:${([Environment]::NewLine)}$details"
-                                }
-                        }
                 }
         }
         finally {
                 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+        }
+}
+
+function Add-CertificateToStore {
+        param(
+                [Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+                [Parameter(Mandatory = $true)][ValidateSet('Root','CA','TrustedPublisher','TrustedPeople')][string]$StoreName
+        )
+
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($StoreName, [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine)
+        try {
+                $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                $existing = $store.Certificates.Find([System.Security.Cryptography.X509Certificates.X509FindType]::FindByThumbprint, $Certificate.Thumbprint, $false)
+                if (-not $existing -or $existing.Count -eq 0) {
+                        $store.Add($Certificate)
+                        Write-Host ("Added {0} to LocalMachine\\{1}: {2}" -f $Certificate.Thumbprint, $StoreName, $Certificate.Subject)
+                }
+                else {
+                        Write-Host ("Already present {0} in LocalMachine\\{1}: {2}" -f $Certificate.Thumbprint, $StoreName, $Certificate.Subject)
+                }
+        }
+        finally {
+                $store.Close()
+        }
+}
+
+function Add-SignerCertsFromCatalogs {
+        param(
+                [Parameter(Mandatory = $true)][string[]]$CatalogPaths
+        )
+
+        foreach ($cat in $CatalogPaths) {
+                if (-not $cat -or -not (Test-Path -LiteralPath $cat)) {
+                        continue
+                }
+
+                $sig = Get-AuthenticodeSignature -LiteralPath $cat
+                $cert = $sig.SignerCertificate
+                if ($cert) {
+                        Add-CertificateToStore -Certificate $cert -StoreName 'TrustedPublisher'
+                        Add-CertificateToStore -Certificate $cert -StoreName 'TrustedPeople'
+                }
+                else {
+                        Write-Host "Warning: no signer certificate found in catalog '$cat'."
+                }
         }
 }
 
@@ -232,6 +277,20 @@ if (-not $netkvm) {
 
 $netkvmCat = [IO.Path]::ChangeExtension((Join-Path $extractPath $netkvm.inf_path), '.cat')
 Install-CatalogCertificateChain -CatalogPath $netkvmCat
+
+# Pre-trust publishers for all selected driver catalogs before installing any drivers.
+$selectedCatalogs = @(
+        $info.drivers |
+                where { $_.arch -eq $arch -and $_.windows_version -eq $os } |
+                ForEach-Object {
+                        $infPath = Join-Path $extractPath $_.inf_path
+                        try { Get-InfCatalogPath -InfPath $infPath } catch { $null }
+                } |
+                Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+)
+if ($selectedCatalogs -and $selectedCatalogs.Count -gt 0) {
+        Add-SignerCertsFromCatalogs -CatalogPaths $selectedCatalogs
+}
 
 $infListPath = Join-Path $pkgDir inflist.txt
 $info.drivers | where { $_.arch -eq $arch -and $_.windows_version -eq $os } | % {
