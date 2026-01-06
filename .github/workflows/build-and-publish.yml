@@ -91,7 +91,7 @@ jobs:
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: virtio-drivers-${{ steps.version.outputs.VERSION }}-${{ github.ref_name }}
+          name: virtio-drivers-${{ steps.version.outputs.VERSION }}-${{ github.run_id }}
           path: virtio-drivers.${{ steps.version.outputs.VERSION }}.nupkg
 
       - name: Publish to Chocolatey Community Repository
