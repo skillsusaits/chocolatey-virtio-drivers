@@ -1,5 +1,72 @@
 $pkgDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $isoPath = Join-Path $pkgDir virtio.iso
+
+function Assert-CommandExists {
+        param(
+                [Parameter(Mandatory = $true)][string]$Name
+        )
+
+        if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+                throw "Required command '$Name' was not found on PATH."
+        }
+}
+
+function Invoke-ExternalExe {
+        param(
+                [Parameter(Mandatory = $true)][string]$FilePath,
+                [Parameter(Mandatory = $true)][string[]]$ArgumentList,
+                [Parameter(Mandatory = $true)][string]$DisplayName
+        )
+
+        $tmp = Join-Path $env:TEMP ([IO.Path]::GetRandomFileName())
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        $stdoutFile = Join-Path $tmp 'stdout.txt'
+        $stderrFile = Join-Path $tmp 'stderr.txt'
+
+        try {
+                $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+                $stdout = @()
+                $stderr = @()
+                if (Test-Path $stdoutFile) { $stdout = Get-Content -LiteralPath $stdoutFile -ErrorAction SilentlyContinue }
+                if (Test-Path $stderrFile) { $stderr = Get-Content -LiteralPath $stderrFile -ErrorAction SilentlyContinue }
+
+                return [pscustomobject]@{
+                        ExitCode = $proc.ExitCode
+                        StdOut = $stdout
+                        StdErr = $stderr
+                        AllOutput = @($stdout + $stderr)
+                        DisplayName = $DisplayName
+                }
+        }
+        finally {
+                Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+        }
+}
+
+function Get-PnpPublishedName {
+        param(
+                [Parameter(Mandatory = $true)][string[]]$OutputLines
+        )
+
+        foreach ($line in $OutputLines) {
+                if ($line -match '(?i)^\s*Published\s+Name\s*:\s*(.+?)\s*$') {
+                        return $Matches[1]
+                }
+        }
+
+        foreach ($line in $OutputLines) {
+                # Another common pattern within pnputil output is an OEM INF name somewhere in the text.
+                if ($line -match '(?i)\b(oem\d+\.inf)\b') {
+                        return $Matches[1]
+                }
+        }
+
+        return $null
+}
+
+Assert-CommandExists -Name 'pnputil.exe'
+Assert-CommandExists -Name 'certutil.exe'
+Assert-CommandExists -Name '7z'
 $downloadArgs = @{
         packageName = $Env:ChocolateyPackageName
         fileFullPath = $isoPath
@@ -9,7 +76,11 @@ $downloadArgs = @{
 }
 Get-ChocolateyWebFile @downloadArgs
 $extractPath = Join-Path $pkgDir virtio
-7z x $isoPath -o"$extractPath"
+$extractResult = Invoke-ExternalExe -FilePath '7z' -ArgumentList @('x', $isoPath, "-o$extractPath") -DisplayName '7z extract virtio.iso'
+$extractResult.AllOutput | ForEach-Object { Write-Host $_ }
+if ($extractResult.ExitCode -ne 0) {
+        throw "7z extraction failed (exit code $($extractResult.ExitCode)) for '$isoPath'."
+}
 Remove-Item $isoPath
 
 $info = ConvertFrom-Json ([IO.File]::ReadAllText((Join-Path $extractPath 'data/info.json')))
@@ -31,25 +102,60 @@ $os = switch ($Env:OS_NAME) {
         'Windows Server 2003' { '2k3' }
 }
 
+if (-not $os) {
+        throw "Unsupported or missing OS_NAME '$($Env:OS_NAME)'. Cannot select matching VirtIO drivers."
+}
+
 # NetKVM is available for all $infRelPath - I extract the Certificate from there
-$netkvm = $info.drivers | where { $_.name -eq 'Red Hat VirtIO Ethernet Adapter' -and $_.arch -eq $arch -and $_.windows_version -eq $os }
+$netkvm = $info.drivers | where { $_.name -eq 'Red Hat VirtIO Ethernet Adapter' -and $_.arch -eq $arch -and $_.windows_version -eq $os } | Select-Object -First 1
+if (-not $netkvm) {
+        throw "Could not locate NetKVM driver entry for arch '$arch' and OS '$os' in info.json."
+}
+
 $cert = (Get-AuthenticodeSignature ([IO.Path]::ChangeExtension((Join-Path $extractPath $netkvm.inf_path), '.cat'))).SignerCertificate;
+if (-not $cert) {
+        throw 'Failed to extract signer certificate from NetKVM catalog (.cat).'
+}
 $certFile = Join-Path $pkgDir 'RedHat.cer'
 $exportType = [Security.Cryptography.X509Certificates.X509ContentType]::Cert;
 [IO.File]::WriteAllBytes($certFile, $cert.Export($exportType));
-certutil.exe -addstore -f TrustedPublisher $certFile
+$certResult = Invoke-ExternalExe -FilePath 'certutil.exe' -ArgumentList @('/addstore', '-f', 'TrustedPublisher', $certFile) -DisplayName 'certutil addstore TrustedPublisher'
+$certResult.AllOutput | ForEach-Object { Write-Host $_ }
+if ($certResult.ExitCode -ne 0) {
+        throw "certutil.exe failed (exit code $($certResult.ExitCode)) while adding TrustedPublisher certificate."
+}
 
 $infListPath = Join-Path $pkgDir inflist.txt
 $info.drivers | where { $_.arch -eq $arch -and $_.windows_version -eq $os } | % {
         $infPath = Join-Path $extractPath $_.inf_path
-        $output = pnputil.exe /add-driver $infPath /install
-        echo $output
-        if ($output[4] -match '^[^:]*: *(.*)') {
-                Add-Content -Path $infListPath -Value $Matches[1]
+
+        $pnpResult = Invoke-ExternalExe -FilePath 'pnputil.exe' -ArgumentList @('/add-driver', $infPath, '/install') -DisplayName "pnputil add-driver ($($_.name))"
+        $pnpResult.AllOutput | ForEach-Object { Write-Host $_ }
+
+        if ($pnpResult.ExitCode -ne 0) {
+                $details = ($pnpResult.AllOutput -join [Environment]::NewLine)
+                throw "pnputil.exe failed (exit code $($pnpResult.ExitCode)) while installing driver '$($_.name)' from '$infPath'. Output:${([Environment]::NewLine)}$details"
+        }
+
+        $publishedName = Get-PnpPublishedName -OutputLines $pnpResult.AllOutput
+        if ($publishedName) {
+                Add-Content -Path $infListPath -Value $publishedName
         }
         if ($_.name -eq 'VirtIO Balloon Driver') {
-                Copy-Item (Join-Path (Split-Path -Parent $infPath) blnsvr.exe) $pkgDir
-                Invoke-Expression "$(Join-Path $pkgDir 'blnsvr.exe') -i"
+                $srcBln = Join-Path (Split-Path -Parent $infPath) 'blnsvr.exe'
+                if (-not (Test-Path -LiteralPath $srcBln)) {
+                        throw "Expected balloon service binary was not found: '$srcBln'"
+                }
+
+                $dstBln = Join-Path $pkgDir 'blnsvr.exe'
+                Copy-Item -Force -LiteralPath $srcBln -Destination $dstBln
+
+                $blnResult = Invoke-ExternalExe -FilePath $dstBln -ArgumentList @('-i') -DisplayName 'blnsvr install'
+                $blnResult.AllOutput | ForEach-Object { Write-Host $_ }
+                if ($blnResult.ExitCode -ne 0) {
+                        $details = ($blnResult.AllOutput -join [Environment]::NewLine)
+                        throw "blnsvr.exe failed (exit code $($blnResult.ExitCode)) during install (-i). Output:${([Environment]::NewLine)}$details"
+                }
         }
 }
 

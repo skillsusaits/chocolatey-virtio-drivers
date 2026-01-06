@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - '*'
+    branches:
+      - '**'
 
 permissions:
   contents: write
@@ -19,17 +21,24 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $tagName = "${{ github.ref_name }}"
-          
-          # Run update script
-          .\update-version.ps1 -VirtioVersion $tagName
-          
-          # Read updated values for outputs
+          $refType = "${{ github.ref_type }}"
+          $refName = "${{ github.ref_name }}"
+
+          if ($refType -eq 'tag') {
+            # For tag builds, update nuspec + install script from the VirtIO tag.
+            .\update-version.ps1 -VirtioVersion $refName
+          } else {
+            Write-Host "Non-tag build ($refType: $refName). Skipping update-version.ps1 and packing current repo state."
+          }
+
+          # Read values for outputs (works for both tag and branch builds)
           $nuspecContent = Get-Content "virtio-drivers.nuspec" -Raw
           if ($nuspecContent -match '<version>(.*?)</version>') {
             $packageVersion = $Matches[1]
+          } else {
+            throw "Could not find <version> in virtio-drivers.nuspec"
           }
-          
+
           $installContent = Get-Content "tools/chocolateyinstall.ps1" -Raw
           if ($installContent -match "url = '(.*?)'") {
             $url = $Matches[1]
@@ -37,16 +46,26 @@ jobs:
           if ($installContent -match "checksum = '(.*?)'") {
             $checksum = $Matches[1]
           }
-          
-          # Set outputs for later steps
+
+          $virtioVersion = $null
+          if ($refType -eq 'tag') {
+            $virtioVersion = $refName
+          } else {
+            if (Test-Path "version.json") {
+              $vj = Get-Content "version.json" -Raw | ConvertFrom-Json
+              if ($vj.virtio_version) { $virtioVersion = $vj.virtio_version }
+            }
+            if (-not $virtioVersion) { $virtioVersion = "(branch build)" }
+          }
+
           echo "VERSION=$packageVersion" >> $env:GITHUB_OUTPUT
-          echo "VIRTIO_VERSION=$tagName" >> $env:GITHUB_OUTPUT
+          echo "VIRTIO_VERSION=$virtioVersion" >> $env:GITHUB_OUTPUT
           echo "URL=$url" >> $env:GITHUB_OUTPUT
           echo "CHECKSUM=$checksum" >> $env:GITHUB_OUTPUT
           echo "CHECKSUM_TYPE=sha512" >> $env:GITHUB_OUTPUT
-          
+
           Write-Host "Package Version: $packageVersion"
-          Write-Host "VirtIO Version: $tagName"
+          Write-Host "VirtIO Version: $virtioVersion"
 
       - name: Install Chocolatey
         shell: pwsh
@@ -69,7 +88,14 @@ jobs:
           Write-Host "Package created: $($package.Name)"
           Write-Host "Package size: $($package.Length) bytes"
 
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: virtio-drivers-${{ steps.version.outputs.VERSION }}-${{ github.ref_name }}
+          path: virtio-drivers.${{ steps.version.outputs.VERSION }}.nupkg
+
       - name: Publish to Chocolatey Community Repository
+        if: github.ref_type == 'tag'
         shell: pwsh
         env:
           CHOCO_API_KEY: ${{ secrets.CHOCO_API_KEY }}
@@ -81,6 +107,7 @@ jobs:
           }
 
       - name: Create GitHub Release
+        if: github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
