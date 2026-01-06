@@ -98,7 +98,7 @@ function Install-CatalogCertificateChain {
 
         try {
                 # Install chain elements (root/intermediates) to ensure pnputil can validate the signature.
-                # Root (self-signed) -> Root store; intermediates -> CA store; signer -> TrustedPublisher.
+                # Root (self-signed) -> Root store; intermediates -> CA store; signer -> TrustedPublisher (+ TrustedPeople).
                 $elements = @($chain.ChainElements | ForEach-Object { $_.Certificate })
                 for ($i = 0; $i -lt $elements.Count; $i++) {
                         $c = $elements[$i]
@@ -117,11 +117,69 @@ function Install-CatalogCertificateChain {
                                 $details = ($addResult.AllOutput -join [Environment]::NewLine)
                                 throw "certutil.exe failed (exit code $($addResult.ExitCode)) while adding certificate to '$storeName' store. Output:${([Environment]::NewLine)}$details"
                         }
+
+                        if ($isSigner) {
+                                $tpResult = Invoke-ExternalExe -FilePath 'certutil.exe' -ArgumentList @('/addstore', '-f', 'TrustedPeople', $cerPath) -DisplayName 'certutil addstore TrustedPeople'
+                                $tpResult.AllOutput | ForEach-Object { Write-Host $_ }
+                                if ($tpResult.ExitCode -ne 0) {
+                                        $details = ($tpResult.AllOutput -join [Environment]::NewLine)
+                                        throw "certutil.exe failed (exit code $($tpResult.ExitCode)) while adding signer certificate to 'TrustedPeople' store. Output:${([Environment]::NewLine)}$details"
+                                }
+                        }
                 }
         }
         finally {
                 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
         }
+}
+
+function Ensure-TrustedRootsFromWindowsUpdate {
+        $tmp = Join-Path $env:TEMP ([IO.Path]::GetRandomFileName())
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+        $sstPath = Join-Path $tmp 'roots.sst'
+
+        try {
+                $genResult = Invoke-ExternalExe -FilePath 'certutil.exe' -ArgumentList @('-generateSSTFromWU', $sstPath) -DisplayName 'certutil generateSSTFromWU roots'
+                $genResult.AllOutput | ForEach-Object { Write-Host $_ }
+                if ($genResult.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $sstPath)) {
+                        $details = ($genResult.AllOutput -join [Environment]::NewLine)
+                        throw "certutil.exe failed to generate root SST from Windows Update (exit code $($genResult.ExitCode)). Output:${([Environment]::NewLine)}$details"
+                }
+
+                $addResult = Invoke-ExternalExe -FilePath 'certutil.exe' -ArgumentList @('/addstore', '-f', 'Root', $sstPath) -DisplayName 'certutil addstore Root (roots.sst)'
+                $addResult.AllOutput | ForEach-Object { Write-Host $_ }
+                if ($addResult.ExitCode -ne 0) {
+                        $details = ($addResult.AllOutput -join [Environment]::NewLine)
+                        throw "certutil.exe failed (exit code $($addResult.ExitCode)) while importing Windows Update roots into 'Root' store. Output:${([Environment]::NewLine)}$details"
+                }
+        }
+        finally {
+                Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+        }
+}
+
+function Get-InfCatalogPath {
+        param(
+                [Parameter(Mandatory = $true)][string]$InfPath
+        )
+
+        if (-not (Test-Path -LiteralPath $InfPath)) {
+                throw "INF file was not found: '$InfPath'"
+        }
+
+        $catalogFile = $null
+        foreach ($line in (Get-Content -LiteralPath $InfPath -ErrorAction SilentlyContinue)) {
+                if ($line -match '(?i)^\s*CatalogFile(?:\.[^=]+)?\s*=\s*([^\s;]+)') {
+                        $catalogFile = $Matches[1]
+                        break
+                }
+        }
+
+        if ($catalogFile) {
+                return (Join-Path (Split-Path -Parent $InfPath) $catalogFile)
+        }
+
+        return [IO.Path]::ChangeExtension($InfPath, '.cat')
 }
 
 Assert-CommandExists -Name 'pnputil.exe'
@@ -179,12 +237,40 @@ $infListPath = Join-Path $pkgDir inflist.txt
 $info.drivers | where { $_.arch -eq $arch -and $_.windows_version -eq $os } | % {
         $infPath = Join-Path $extractPath $_.inf_path
 
+        # Some driver packages may be signed with a different chain; install the chain for each INF's catalog.
+        $catPath = $null
+        try {
+                $catPath = Get-InfCatalogPath -InfPath $infPath
+                if ($catPath -and (Test-Path -LiteralPath $catPath)) {
+                        Install-CatalogCertificateChain -CatalogPath $catPath
+                }
+        }
+        catch {
+                Write-Host "Warning: failed to install catalog certificate chain for '$infPath'. $_"
+        }
+
         $pnpResult = Invoke-ExternalExe -FilePath 'pnputil.exe' -ArgumentList @('/add-driver', $infPath, '/install') -DisplayName "pnputil add-driver ($($_.name))"
         $pnpResult.AllOutput | ForEach-Object { Write-Host $_ }
 
         if ($pnpResult.ExitCode -ne 0) {
-                $details = ($pnpResult.AllOutput -join [Environment]::NewLine)
-                throw "pnputil.exe failed (exit code $($pnpResult.ExitCode)) while installing driver '$($_.name)' from '$infPath'. Output:${([Environment]::NewLine)}$details"
+                # CERT_E_UNTRUSTEDROOT (0x800B0109) is common on images without an updated root store.
+                if ($pnpResult.ExitCode -eq -2146762487) {
+                        Write-Host 'pnputil reported CERT_E_UNTRUSTEDROOT; attempting to refresh Windows root certificates and retry once...'
+                        Ensure-TrustedRootsFromWindowsUpdate
+
+                        if ($catPath -and (Test-Path -LiteralPath $catPath)) {
+                                Install-CatalogCertificateChain -CatalogPath $catPath
+                        }
+
+                        $retry = Invoke-ExternalExe -FilePath 'pnputil.exe' -ArgumentList @('/add-driver', $infPath, '/install') -DisplayName "pnputil add-driver retry ($($_.name))"
+                        $retry.AllOutput | ForEach-Object { Write-Host $_ }
+                        $pnpResult = $retry
+                }
+
+                if ($pnpResult.ExitCode -ne 0) {
+                        $details = ($pnpResult.AllOutput -join [Environment]::NewLine)
+                        throw "pnputil.exe failed (exit code $($pnpResult.ExitCode)) while installing driver '$($_.name)' from '$infPath'. Output:${([Environment]::NewLine)}$details"
+                }
         }
 
         $publishedName = Get-PnpPublishedName -OutputLines @($pnpResult.AllOutput)
