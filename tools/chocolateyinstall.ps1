@@ -68,6 +68,62 @@ function Get-PnpPublishedName {
         return $null
 }
 
+function Install-CatalogCertificateChain {
+        param(
+                [Parameter(Mandatory = $true)][string]$CatalogPath
+        )
+
+        if (-not (Test-Path -LiteralPath $CatalogPath)) {
+                throw "Catalog file was not found: '$CatalogPath'"
+        }
+
+        $sig = Get-AuthenticodeSignature -LiteralPath $CatalogPath
+        $signer = $sig.SignerCertificate
+        if (-not $signer) {
+            throw "Failed to extract signer certificate from catalog: '$CatalogPath'"
+        }
+
+        $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $chain.ChainPolicy.RevocationFlag = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::EntireChain
+        $chain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+
+        $null = $chain.Build($signer)
+        if (-not $chain.ChainElements -or $chain.ChainElements.Count -eq 0) {
+                throw "Could not build certificate chain from signer certificate for '$CatalogPath'."
+        }
+
+        $tmp = Join-Path $env:TEMP ([IO.Path]::GetRandomFileName())
+        New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+
+        try {
+                # Install chain elements (root/intermediates) to ensure pnputil can validate the signature.
+                # Root (self-signed) -> Root store; intermediates -> CA store; signer -> TrustedPublisher.
+                $elements = @($chain.ChainElements | ForEach-Object { $_.Certificate })
+                for ($i = 0; $i -lt $elements.Count; $i++) {
+                        $c = $elements[$i]
+
+                        $isSelfSigned = ($c.Subject -eq $c.Issuer)
+                        $isSigner = ($c.Thumbprint -eq $signer.Thumbprint)
+
+                        $storeName = if ($isSelfSigned) { 'Root' } elseif ($isSigner) { 'TrustedPublisher' } else { 'CA' }
+
+                        $cerPath = Join-Path $tmp ("chain-{0:D2}-{1}.cer" -f $i, $storeName)
+                        [IO.File]::WriteAllBytes($cerPath, $c.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+
+                        $addResult = Invoke-ExternalExe -FilePath 'certutil.exe' -ArgumentList @('/addstore', '-f', $storeName, $cerPath) -DisplayName "certutil addstore $storeName"
+                        $addResult.AllOutput | ForEach-Object { Write-Host $_ }
+                        if ($addResult.ExitCode -ne 0) {
+                                $details = ($addResult.AllOutput -join [Environment]::NewLine)
+                                throw "certutil.exe failed (exit code $($addResult.ExitCode)) while adding certificate to '$storeName' store. Output:${([Environment]::NewLine)}$details"
+                        }
+                }
+        }
+        finally {
+                Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+        }
+}
+
 Assert-CommandExists -Name 'pnputil.exe'
 Assert-CommandExists -Name 'certutil.exe'
 Assert-CommandExists -Name '7z'
@@ -110,24 +166,14 @@ if (-not $os) {
         throw "Unsupported or missing OS_NAME '$($Env:OS_NAME)'. Cannot select matching VirtIO drivers."
 }
 
-# NetKVM is available for all $infRelPath - I extract the Certificate from there
+# NetKVM is available for all $infRelPath - we extract the signing chain from its catalog (.cat)
 $netkvm = $info.drivers | where { $_.name -eq 'Red Hat VirtIO Ethernet Adapter' -and $_.arch -eq $arch -and $_.windows_version -eq $os } | Select-Object -First 1
 if (-not $netkvm) {
         throw "Could not locate NetKVM driver entry for arch '$arch' and OS '$os' in info.json."
 }
 
-$cert = (Get-AuthenticodeSignature ([IO.Path]::ChangeExtension((Join-Path $extractPath $netkvm.inf_path), '.cat'))).SignerCertificate;
-if (-not $cert) {
-        throw 'Failed to extract signer certificate from NetKVM catalog (.cat).'
-}
-$certFile = Join-Path $pkgDir 'RedHat.cer'
-$exportType = [Security.Cryptography.X509Certificates.X509ContentType]::Cert;
-[IO.File]::WriteAllBytes($certFile, $cert.Export($exportType));
-$certResult = Invoke-ExternalExe -FilePath 'certutil.exe' -ArgumentList @('/addstore', '-f', 'TrustedPublisher', $certFile) -DisplayName 'certutil addstore TrustedPublisher'
-$certResult.AllOutput | ForEach-Object { Write-Host $_ }
-if ($certResult.ExitCode -ne 0) {
-        throw "certutil.exe failed (exit code $($certResult.ExitCode)) while adding TrustedPublisher certificate."
-}
+$netkvmCat = [IO.Path]::ChangeExtension((Join-Path $extractPath $netkvm.inf_path), '.cat')
+Install-CatalogCertificateChain -CatalogPath $netkvmCat
 
 $infListPath = Join-Path $pkgDir inflist.txt
 $info.drivers | where { $_.arch -eq $arch -and $_.windows_version -eq $os } | % {
