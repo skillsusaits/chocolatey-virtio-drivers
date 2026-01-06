@@ -311,7 +311,25 @@ $info.drivers | where { $_.arch -eq $arch -and $_.windows_version -eq $os } | % 
         $pnpResult = Invoke-ExternalExe -FilePath 'pnputil.exe' -ArgumentList @('/add-driver', $infPath, '/install') -DisplayName "pnputil add-driver ($($_.name))"
         $pnpResult.AllOutput | ForEach-Object { Write-Host $_ }
 
-        if ($pnpResult.ExitCode -ne 0) {
+        # pnputil exit codes can be non-zero even when the driver is already present / up-to-date.
+        $pnpSucceeded = $false
+        $allText = ($pnpResult.AllOutput -join "`n")
+
+        if ($pnpResult.ExitCode -eq 0) {
+                $pnpSucceeded = $true
+        }
+        elseif ($pnpResult.ExitCode -eq 259) {
+                # 259 (ERROR_NO_MORE_ITEMS) is commonly returned when the driver already exists.
+                if ($allText -match '(?i)Driver package added successfully' -or $allText -match '(?i)Already exists in the system' -or $allText -match '(?i)up-to-date on device') {
+                        $pnpSucceeded = $true
+                }
+        }
+        elseif ($pnpResult.ExitCode -eq 3010 -or $pnpResult.ExitCode -eq 1641) {
+                # Reboot required / initiated.
+                $pnpSucceeded = $true
+        }
+
+        if (-not $pnpSucceeded) {
                 # CERT_E_UNTRUSTEDROOT (0x800B0109) is common on images without an updated root store.
                 if ($pnpResult.ExitCode -eq -2146762487) {
                         Write-Host 'pnputil reported CERT_E_UNTRUSTEDROOT; attempting to refresh Windows root certificates and retry once...'
@@ -324,9 +342,20 @@ $info.drivers | where { $_.arch -eq $arch -and $_.windows_version -eq $os } | % 
                         $retry = Invoke-ExternalExe -FilePath 'pnputil.exe' -ArgumentList @('/add-driver', $infPath, '/install') -DisplayName "pnputil add-driver retry ($($_.name))"
                         $retry.AllOutput | ForEach-Object { Write-Host $_ }
                         $pnpResult = $retry
+                        $allText = ($pnpResult.AllOutput -join "`n")
+
+                        if ($pnpResult.ExitCode -eq 0) {
+                                $pnpSucceeded = $true
+                        }
+                        elseif ($pnpResult.ExitCode -eq 259 -and ($allText -match '(?i)Driver package added successfully' -or $allText -match '(?i)Already exists in the system' -or $allText -match '(?i)up-to-date on device')) {
+                                $pnpSucceeded = $true
+                        }
+                        elseif ($pnpResult.ExitCode -eq 3010 -or $pnpResult.ExitCode -eq 1641) {
+                                $pnpSucceeded = $true
+                        }
                 }
 
-                if ($pnpResult.ExitCode -ne 0) {
+                if (-not $pnpSucceeded) {
                         $details = ($pnpResult.AllOutput -join [Environment]::NewLine)
                         throw "pnputil.exe failed (exit code $($pnpResult.ExitCode)) while installing driver '$($_.name)' from '$infPath'. Output:${([Environment]::NewLine)}$details"
                 }
